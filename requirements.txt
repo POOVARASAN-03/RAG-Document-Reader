@@ -1,4 +1,4 @@
-﻿streamlit
+streamlit
 PyPDF2
 python-docx
 python-pptx
@@ -7,3 +7,4 @@ langchain-community
 langchain-google-genai
 google-generativeai
 python-dotenv
+faiss-cpu
