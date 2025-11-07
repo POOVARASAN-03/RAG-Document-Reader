@@ -1,98 +1,153 @@
-import streamlit as st
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import google.generativeai as genai
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+import streamlit as st
 from dotenv import load_dotenv
+from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.embeddings import HuggingFaceEmbeddings
+
+# ✅ Load environment variables
 load_dotenv()
 
-def get_pdf_text(pdf_docs):
+# Ensure Google API Key exists
+if "GOOGLE_API_KEY" not in os.environ or not os.environ["GOOGLE_API_KEY"]:
+    st.error("❌ GOOGLE_API_KEY not found in .env file. Please add it before running.")
+    st.stop()
+
+# --- Extract text from PDF, DOCX, PPTX ---
+def get_text_from_files(files):
     text = ""
-    for file in pdf_docs:
+    for file in files:
         ext = os.path.splitext(file.name)[1].lower()
-        
+
         if ext == ".pdf":
-            pdf_reader = PdfReader(file)
-            for page in pdf_reader.pages:
+            reader = PdfReader(file)
+            for page in reader.pages:
                 page_text = page.extract_text()
                 if page_text:
-                    text += page_text
-        
+                    text += page_text + "\n"
+
         elif ext == ".docx":
             doc = Document(file)
             for para in doc.paragraphs:
                 text += para.text + "\n"
-                
+
         elif ext == ".pptx":
-            presentation = Presentation(file)
-            for slide in presentation.slides:
+            ppt = Presentation(file)
+            for slide in ppt.slides:
                 for shape in slide.shapes:
                     if hasattr(shape, "text"):
                         text += shape.text + "\n"
-        
-        else:
-            text += f"[Unsupported file format: {ext}]\n"
-    
-    return text
 
+        else:
+            st.warning(f"⚠️ Unsupported file format: {ext}")
+
+    return text.strip()
+
+
+# --- Split text into chunks ---
 def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    chunks = text_splitter.split_text(text)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = splitter.split_text(text)
     return chunks
 
-def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
 
-def get_conversational_chain():
+# --- Create FAISS vector store ---
+@st.cache_resource
+def create_vector_store(chunks):
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    store = FAISS.from_texts(chunks, embedding=embeddings)
+    store.save_local("faiss_index")
+    return store
+
+
+# --- Build conversational QA chain ---
+def build_conversational_chain():
     prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
+    Answer the question as accurately and detailed as possible using the context below.
+    If the answer is not in the context, say "The answer is not available in the context."
+    Keep the tone factual and concise.
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+
     Answer:
     """
 
-    model = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.3
+    )
+
+    prompt = PromptTemplate(
+        template=prompt_template,
+        input_variables=["context", "question"]
+    )
+
+    chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
     return chain
 
-def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    docs = new_db.similarity_search(user_question)
-    chain = get_conversational_chain()
-    response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-    print(response)
-    st.write("Reply: ", response["output_text"])
 
+# --- Process user query ---
+def handle_user_query(question):
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+    try:
+        db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    except Exception as e:
+        st.error("❌ Vector store not found. Please upload and process documents first.")
+        st.stop()
+
+    docs = db.similarity_search(question)
+    chain = build_conversational_chain()
+    response = chain({"input_documents": docs, "question": question}, return_only_outputs=True)
+
+    st.markdown("### 💬 **Response:**")
+    st.write(response["output_text"])
+
+
+# --- Streamlit UI ---
 def main():
-    st.set_page_config(page_title="Chat PDF")
-    st.header("Interactive RAG-based LLM for Multi-PDF Document Analysis", divider='rainbow')
+    st.set_page_config(page_title="RAG Document Chat", page_icon="📚")
+    st.title("📚 Multi-Document RAG-based Gemini Assistant")
 
-    user_question = st.text_input("Ask a Question from the PDF Files")
+    st.write("Upload PDF, DOCX, or PPTX files and ask questions based on their content.")
 
-    if user_question:
-        user_input(user_question)
-
+    # Sidebar
     with st.sidebar:
-        st.title("Menu:")
-        pdf_docs = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True)
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                raw_text = get_pdf_text(pdf_docs)
-                text_chunks = get_text_chunks(raw_text)
-                get_vector_store(text_chunks)
-                st.success("Done")
+        st.header("📂 Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Choose your documents",
+            type=["pdf", "docx", "pptx"],
+            accept_multiple_files=True
+        )
+
+        if st.button("📖 Process Documents"):
+            if uploaded_files:
+                with st.spinner("Extracting and indexing documents..."):
+                    text = get_text_from_files(uploaded_files)
+                    if not text.strip():
+                        st.error("❌ No text could be extracted from the files.")
+                        return
+                    chunks = get_text_chunks(text)
+                    create_vector_store(chunks)
+                    st.success("✅ Documents processed and stored successfully!")
+            else:
+                st.warning("Please upload at least one document before processing.")
+
+    # User question input
+    question = st.text_input("💭 Ask a question based on your uploaded documents:")
+    if question:
+        handle_user_query(question)
+
 
 if __name__ == "__main__":
     main()
