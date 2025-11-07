@@ -4,20 +4,23 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
+
+# ✅ LangChain imports for v1.0.4 + community 0.4.1
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+from langchain.chains.combine_documents.stuff import create_stuff_documents_chain
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+from langchain.chains.llm import LLMChain
 
-# ✅ Load environment variables
+# --- Load environment variables ---
 load_dotenv()
-
-# Ensure Google API Key exists
 if "GOOGLE_API_KEY" not in os.environ or not os.environ["GOOGLE_API_KEY"]:
-    st.error("❌ GOOGLE_API_KEY not found in .env file. Please add it before running.")
+    st.error("❌ GOOGLE_API_KEY not found in .env file.")
     st.stop()
+
 
 # --- Extract text from PDF, DOCX, PPTX ---
 def get_text_from_files(files):
@@ -43,7 +46,6 @@ def get_text_from_files(files):
                 for shape in slide.shapes:
                     if hasattr(shape, "text"):
                         text += shape.text + "\n"
-
         else:
             st.warning(f"⚠️ Unsupported file format: {ext}")
 
@@ -66,7 +68,7 @@ def create_vector_store(chunks):
     return store
 
 
-# --- Build conversational QA chain ---
+# --- Build QA chain ---
 def build_conversational_chain():
     prompt_template = """
     Answer the question as accurately and detailed as possible using the context below.
@@ -82,52 +84,55 @@ def build_conversational_chain():
     Answer:
     """
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0.3
-    )
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
+    # ✅ Create LLM chain
+    llm_chain = LLMChain(llm=llm, prompt=prompt)
 
-    chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
+    # ✅ StuffDocumentsChain does the "combine all docs" logic
+    chain = StuffDocumentsChain(llm_chain=llm_chain, document_variable_name="context")
+
     return chain
 
 
-# --- Process user query ---
+# --- Handle user query ---
 def handle_user_query(question):
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
     try:
         db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    except Exception as e:
+    except Exception:
         st.error("❌ Vector store not found. Please upload and process documents first.")
         st.stop()
 
+    # Retrieve similar docs
     docs = db.similarity_search(question)
     chain = build_conversational_chain()
-    response = chain({"input_documents": docs, "question": question}, return_only_outputs=True)
 
+    # Run the chain
+    response = chain.invoke({"input_documents": docs, "question": question})
+
+    # ✅ Handle structured output properly
+    if isinstance(response, dict):
+        answer = response.get("output_text", "⚠️ No response generated.")
+    else:
+        answer = str(response)
+
+    # ✅ Display in Streamlit
     st.markdown("### 💬 **Response:**")
-    st.write(response["output_text"])
-
+    st.write(answer)
 
 # --- Streamlit UI ---
 def main():
-    st.set_page_config(page_title="RAG Document Chat", page_icon="📚")
+    st.set_page_config(page_title="RAG Document Chat", page_icon="📘")
     st.title("📚 Multi-Document RAG-based Gemini Assistant")
-
     st.write("Upload PDF, DOCX, or PPTX files and ask questions based on their content.")
 
-    # Sidebar
     with st.sidebar:
         st.header("📂 Upload Documents")
         uploaded_files = st.file_uploader(
-            "Choose your documents",
-            type=["pdf", "docx", "pptx"],
-            accept_multiple_files=True
+            "Choose your documents", type=["pdf", "docx", "pptx"], accept_multiple_files=True
         )
 
         if st.button("📖 Process Documents"):
@@ -143,7 +148,6 @@ def main():
             else:
                 st.warning("Please upload at least one document before processing.")
 
-    # User question input
     question = st.text_input("💭 Ask a question based on your uploaded documents:")
     if question:
         handle_user_query(question)
